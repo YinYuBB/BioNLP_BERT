@@ -10,7 +10,10 @@ def load_data(jsonl_file):
     data = []
     with open(jsonl_file, 'r', encoding='utf-8') as f:
         for line in f:
-            data.append(json.loads(line))
+            try:
+                data.append(json.loads(line))
+            except json.JSONDecodeError:
+                print(f"Warning: Skipping invalid JSON line")
     
     # Filter for required fields
     filtered_data = []
@@ -55,6 +58,7 @@ def predict(model_path, data):
         result = {
             'paperId': item.get('paperId', ''),
             'title': item.get('title', ''),
+            "abstract": item.get('abstract', ''),
             'predicted_label': id2label[prediction],
             'confidence': probabilities[0][prediction].item()
         }
@@ -80,8 +84,8 @@ def main(model_path, input_jsonl, output_jsonl):
     
     # Print summary
     predictions = [r['predicted_label'] for r in results]
-    bionlp_count = predictions.count('BioNLP')
-    non_bionlp_count = predictions.count('Non_BioNLP')
+    bionlp_count = predictions.count('Y')
+    non_bionlp_count = predictions.count('N')
     
     print(f"Summary:")
     print(f"  BioNLP papers: {bionlp_count} ({bionlp_count/len(predictions)*100:.1f}%)")

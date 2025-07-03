@@ -2,13 +2,15 @@ import json
 import pandas as pd
 from datasets import Dataset
 from transformers import AutoTokenizer, DataCollatorWithPadding, AutoModelForSequenceClassification, TrainingArguments, Trainer
-import evaluate
 import numpy as np
 import torch
 import argparse
-from sklearn.model_selection import train_test_split
+import evaluate
+import os
+
 
 def load_and_preprocess_data(jsonl_file):
+    """Load and preprocess data from JSONL file with new format"""
     # Load the dataset from JSONL file
     data = []
     with open(jsonl_file, 'r', encoding='utf-8') as f:
@@ -21,7 +23,7 @@ def load_and_preprocess_data(jsonl_file):
     # Filter for required fields and valid labels
     filtered_data = []
     for item in data:
-        if all(key in item for key in ['title', 'abstract', 'is_bionlp']) and item['is_bionlp'] in ['BioNLP', 'Non_BioNLP']:
+        if all(key in item for key in ['title', 'abstract', 'isBionlp']) and item['isBionlp'] in ['Y', 'N']:
             filtered_data.append(item)
     
     # Convert to DataFrame
@@ -32,29 +34,24 @@ def load_and_preprocess_data(jsonl_file):
     
     # Define label mapping for binary classification
     label2id = {
-        'BioNLP': 1,
-        'Non_BioNLP': 0
+        'Y': 1,  # BioNLP
+        'N': 0   # Non-BioNLP
     }
     
     # Encode the labels
-    df['label'] = df['is_bionlp'].map(label2id)
-    
-    # Split the data into train and dev sets if 'split' column doesn't exist
-    if 'split' not in df.columns:
-        train_df, dev_df = train_test_split(df, test_size=0.2, random_state=42, stratify=df['label'])
-        train_df['split'] = 'train'
-        dev_df['split'] = 'dev'
-        df = pd.concat([train_df, dev_df])
+    df['label'] = df['isBionlp'].map(label2id)
     
     # Clean the data by selecting only the necessary columns
-    df = df[['text', 'label', 'split']]
+    df = df[['text', 'label']].reset_index(drop=True)
     
-    # Transform the pandas DataFrame to Hugging Face Dataset
-    dataset = Dataset.from_pandas(df)
+    print(f"Loaded {len(df)} samples")
+    print(f"Label distribution: {df['label'].value_counts().to_dict()}")
     
-    return dataset, label2id
+    return Dataset.from_pandas(df), label2id
+
 
 def tokenize_dataset(dataset, tokenizer_name):
+    """Tokenize the dataset"""
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     
@@ -84,10 +81,9 @@ def compute_metrics(eval_pred):
     prec = precision.compute(predictions=predictions, references=labels, average='macro')
     rec = recall.compute(predictions=predictions, references=labels, average='macro')
     
-    # Compute per-class metrics
     f1_classes = f1.compute(predictions=predictions, references=labels, average=None)
-    f1_non_bionlp = f1_classes['f1'][0]  # index 0 corresponds to 'Non_BioNLP'
-    f1_bionlp = f1_classes['f1'][1]      # index 1 corresponds to 'BioNLP'
+    f1_non_bionlp = f1_classes['f1'][0]
+    f1_bionlp = f1_classes['f1'][1]
     
     return {
         'accuracy': acc['accuracy'],
@@ -98,78 +94,71 @@ def compute_metrics(eval_pred):
         'f1_bionlp': f1_bionlp
     }
 
-def main(model_name, jsonl_file, output_dir):
-    # Load and preprocess data
-    dataset, label2id = load_and_preprocess_data(jsonl_file)
+def main(model_name, train_file, eval_file, output_dir):
+    # Load and tokenize training data
+    train_dataset_raw, label2id = load_and_preprocess_data(train_file)
+    train_dataset_tokenized, tokenizer, data_collator = tokenize_dataset(train_dataset_raw, model_name)
+    train_dataset_tokenized = train_dataset_tokenized.remove_columns(['text'])
     
-    # Tokenize the dataset
-    tokenized_dataset, tokenizer, data_collator = tokenize_dataset(dataset, model_name)
+    # Optionally load and tokenize evaluation data
+    eval_dataset_tokenized = None
+    if eval_file:
+        eval_dataset_raw, _ = load_and_preprocess_data(eval_file)
+        eval_dataset_tokenized, _, _ = tokenize_dataset(eval_dataset_raw, model_name)
+        eval_dataset_tokenized = eval_dataset_tokenized.remove_columns(['text'])
     
-    # Id2label for binary classification
+    # Mapping
     id2label = {v: k for k, v in label2id.items()}
     
-    # Split the dataset according to 'split' column
-    train_dataset = tokenized_dataset.filter(lambda example: example['split'] == 'train')
-    eval_dataset = tokenized_dataset.filter(lambda example: example['split'] == 'dev')
-    
-    # Remove unnecessary columns
-    train_dataset = train_dataset.remove_columns(['text', 'split'])
-    eval_dataset = eval_dataset.remove_columns(['text', 'split'])
-    
-    # Load model for binary classification
+    # Load model
     model = AutoModelForSequenceClassification.from_pretrained(
-        model_name, 
-        num_labels=2, 
-        id2label=id2label, 
+        model_name,
+        num_labels=2,
+        id2label=id2label,
         label2id=label2id
     )
     
-    # Check if CUDA is available and set device
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     model.to(device)
     
-    # Define training arguments
+    # Training arguments
     training_args = TrainingArguments(
         output_dir=output_dir,
         learning_rate=3e-5,
-        per_device_train_batch_size=64,
-        per_device_eval_batch_size=64,
+        per_device_train_batch_size=16,
         num_train_epochs=5,
         weight_decay=0.01,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
-        load_best_model_at_end=True,
-        metric_for_best_model="f1"
+        evaluation_strategy="epoch" if eval_dataset_tokenized else "no",
+        save_strategy="epoch" if eval_dataset_tokenized else "no",
+        logging_steps=100,
+        load_best_model_at_end=bool(eval_dataset_tokenized),
+        metric_for_best_model="f1" if eval_dataset_tokenized else None,
+        report_to=None
     )
     
-    # Initialize the Trainer
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
+        train_dataset=train_dataset_tokenized,
+        eval_dataset=eval_dataset_tokenized,
         tokenizer=tokenizer,
         data_collator=data_collator,
-        compute_metrics=compute_metrics
+        compute_metrics=compute_metrics if eval_dataset_tokenized else None
     )
     
-    # Train the model
     trainer.train()
-    
-    # Save the model
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a binary classification model for BioNLP.")
     parser.add_argument("--model_name", type=str, default="bert-base-uncased",
-                      help="The name of the pre-trained model.")
-    parser.add_argument("--jsonl_file", type=str, required=True,
-                      help="The JSONL file containing the dataset.")
+                        help="The name of the pre-trained model.")
+    parser.add_argument("--train_data", type=str, required=True,
+                        help="Path to the training JSONL file.")
+    parser.add_argument("--eval_data", type=str, default=None,
+                        help="(Optional) Path to the evaluation JSONL file.")
     parser.add_argument("--output_dir", type=str, required=True,
-                      help="The output directory where the model and checkpoints will be written.")
-    
+                        help="The output directory to save model and tokenizer.")
     args = parser.parse_args()
-    main(args.model_name, args.jsonl_file, args.output_dir)
-
-
+    main(args.model_name, args.train_data, args.eval_data, args.output_dir)

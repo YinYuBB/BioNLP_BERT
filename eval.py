@@ -9,26 +9,44 @@ import evaluate
 from tqdm import tqdm
 
 def load_and_preprocess_data(jsonl_file):
+    """Load and preprocess data from JSONL file with new format"""
     # Load the dataset from JSONL file
     data = []
     with open(jsonl_file, 'r', encoding='utf-8') as f:
         for line in f:
-            data.append(json.loads(line))
-
+            try:
+                data.append(json.loads(line))
+            except json.JSONDecodeError:
+                print(f"Warning: Skipping invalid JSON line")
+    
     # Filter for required fields and valid labels
     filtered_data = []
     for item in data:
-        if all(key in item for key in ['title', 'abstract', 'is_bionlp']) and item['is_bionlp'] in ['BioNLP', 'Non_BioNLP']:
+        if all(key in item for key in ['title', 'abstract', 'isBionlp']) and item['isBionlp'] in ['Y', 'N']:
             filtered_data.append(item)
-
+    
+    # Convert to DataFrame
     df = pd.DataFrame(filtered_data)
+    
+    # Combine title and abstract as input text
     df['text'] = 'Title: ' + df['title'].fillna('') + '\nAbstract: ' + df['abstract'].fillna('')
-    label2id = {'BioNLP': 1, 'Non_BioNLP': 0}
-    df['label'] = df['is_bionlp'].map(label2id)
-
-    df = df[['text', 'label']]  
-    dataset = Dataset.from_pandas(df)
-    return dataset, label2id
+    
+    # Define label mapping for binary classification
+    label2id = {
+        'Y': 1,  # BioNLP
+        'N': 0   # Non-BioNLP
+    }
+    
+    # Encode the labels
+    df['label'] = df['isBionlp'].map(label2id)
+    
+    # Clean the data by selecting only the necessary columns
+    df = df[['text', 'label']].reset_index(drop=True)
+    
+    print(f"Loaded {len(df)} samples")
+    print(f"Label distribution: {df['label'].value_counts().to_dict()}")
+    
+    return Dataset.from_pandas(df), label2id
 
 
 def compute_metrics(predictions, labels):
