@@ -13,13 +13,18 @@ def load_data(jsonl_file):
             try:
                 data.append(json.loads(line))
             except json.JSONDecodeError:
-                print(f"Warning: Skipping invalid JSON line")
+                print("Warning: Skipping invalid JSON line")
     
-    # Filter for required fields
+    # Filter for required fields, falling back to abstract_extra when abstract is null
     filtered_data = []
     for item in data:
-        if all(key in item for key in ['title', 'abstract']):
-            filtered_data.append(item)
+        if 'title' in item and 'abstract' in item:
+            # use abstract if not null, otherwise fallback to abstract_extra
+            if item['abstract'] is not None:
+                filtered_data.append(item)
+            elif item.get('abstract_extra') is not None:
+                item['abstract'] = item['abstract_extra']
+                filtered_data.append(item)
     
     return filtered_data
 
